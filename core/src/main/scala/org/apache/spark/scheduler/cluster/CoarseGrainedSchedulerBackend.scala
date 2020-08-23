@@ -76,6 +76,9 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
   // `CoarseGrainedSchedulerBackend.this`.
   private val executorDataMap = new HashMap[String, ExecutorData]
 
+  // kuofeng
+  private var nicExecutorData: ExecutorData = null
+
   // Number of executors for each ResourceProfile requested by the cluster
   // manager, [[ExecutorAllocationManager]]
   @GuardedBy("CoarseGrainedSchedulerBackend.this")
@@ -143,6 +146,8 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
       case StatusUpdate(executorId, taskId, state, data, resources) =>
         scheduler.statusUpdate(taskId, state, data.value)
         if (TaskState.isFinished(state)) {
+          logInfo("kuofeng: StatusUpdate in scheduler, task finished from host: " +
+            executorDataMap(executorId).executorHost)
           executorDataMap.get(executorId) match {
             case Some(executorInfo) =>
               val rpId = executorInfo.resourceProfileId
@@ -211,7 +216,28 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
 
       case RegisterExecutor(executorId, executorRef, hostname, cores, logUrls,
           attributes, resources, resourceProfileId) =>
-        if (executorDataMap.contains(executorId)) {
+        logInfo("kuofeng: RegisterExecutor in schedulerBackend. executorIP: " + hostname)
+        // kuofeng
+        if (hostname.equals("192.168.100.201")) {
+          // If the executor's rpc env is not listening for incoming connections, `hostPort`
+          // will be null, and the client connection should be used to contact the executor.
+          val executorAddress = if (executorRef.address != null) {
+              executorRef.address
+            } else {
+              context.senderAddress
+            }
+          val resourcesInfo = resources.map { case (rName, info) =>
+            // tell the executor it can schedule resources up to numSlotsPerAddress times,
+            // as configured by the user, or set to 1 as that is the default (1 task/resource)
+            val numParts = scheduler.sc.resourceProfileManager
+              .resourceProfileFromId(resourceProfileId).getNumSlotsPerAddress(rName, conf)
+            (info.name, new ExecutorResourceInfo(info.name, info.addresses, numParts))
+          }
+          nicExecutorData = new ExecutorData(executorRef, executorAddress, hostname,
+            0, cores, logUrlHandler.applyPattern(logUrls, attributes), attributes,
+            resourcesInfo, resourceProfileId)
+          context.reply(true)
+        } else if (executorDataMap.contains(executorId)) {
           context.sendFailure(new IllegalStateException(s"Duplicate executor ID: $executorId"))
         } else if (scheduler.nodeBlacklist.contains(hostname) ||
             isBlacklisted(executorId, hostname)) {
@@ -381,7 +407,13 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
 
           logInfo(s"kuofeng: SchedulerBackend send LaunchTask to Execuitor, " +
             s"host: " + executorData.executorHost);
-          executorData.executorEndpoint.send(LaunchTask(new SerializableBuffer(serializedTask)))
+
+          if (executorData.executorHost.equals("192.168.100.202")) {
+            nicExecutorData.executorEndpoint.send(
+              LaunchTask(new SerializableBuffer(serializedTask)))
+          } else {
+            executorData.executorEndpoint.send(LaunchTask(new SerializableBuffer(serializedTask)))
+          }
         }
       }
     }

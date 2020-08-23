@@ -17,7 +17,8 @@
 
 package org.apache.spark.executor
 
-import java.io.{File, NotSerializableException}
+// kuofeng: add two writters
+import java.io.{BufferedWriter, File, FileWriter, NotSerializableException}
 import java.lang.Thread.UncaughtExceptionHandler
 import java.lang.management.ManagementFactory
 import java.net.{URI, URL}
@@ -335,6 +336,9 @@ private[spark] class Executor(
       private val taskDescription: TaskDescription)
     extends Runnable {
 
+    // kuofeng
+    val createdTime = System.currentTimeMillis()
+
     val taskId = taskDescription.taskId
     val taskName = taskDescription.name
     val threadName = s"Executor task launch worker for $taskName"
@@ -413,7 +417,16 @@ private[spark] class Executor(
       (accums, accUpdates)
     }
 
+    // kuofeng
+    def myLog(s: String): Unit = {
+      val file = new File("/home/kuofeng/myTaskRunnerLog-" + createdTime)
+      val bw = new BufferedWriter(new FileWriter(file, true))
+      bw.write(s + "\n")
+      bw.close()
+    }
+
     override def run(): Unit = {
+      myLog("kuofeng: TaskRunner run")
       setMDCForTask(taskName, mdcProperties)
       threadId = Thread.currentThread.getId
       Thread.currentThread.setName(threadName)

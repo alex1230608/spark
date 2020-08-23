@@ -86,12 +86,6 @@ private[spark] class CoarseGrainedExecutorBackend(
   @volatile private var decommissioned = false
 
   override def onStart(): Unit = {
-    // kuofeng
-    val file = new File("/home/kuofeng/myExecutorBackendLog-" + createdTime)
-    val bw = new BufferedWriter(new FileWriter(file, true))
-    bw.write(s"kuofeng: executorBackend start\n")
-    bw.close()
-
     logInfo("Registering PWR handler.")
     SignalUtils.register("PWR", "Failed to register SIGPWR handler - " +
       "disabling decommission feature.")(decommissionSelf)
@@ -160,28 +154,50 @@ private[spark] class CoarseGrainedExecutorBackend(
       .map(e => (e._1.substring(prefix.length).toUpperCase(Locale.ROOT), e._2)).toMap
   }
 
+  def myLog(s: String): Unit = {
+    val file = new File("/home/kuofeng/myExecutorBackendLog-" + createdTime)
+    val bw = new BufferedWriter(new FileWriter(file, true))
+    bw.write(s + "\n")
+    bw.close()
+  }
+
   override def receive: PartialFunction[Any, Unit] = {
     case RegisteredExecutor =>
       logInfo("Successfully registered with driver")
-      try {
-        executor = new Executor(executorId, hostname, env, userClassPath, isLocal = false,
-          resources = _resources)
-        driver.get.send(LaunchedExecutor(executorId))
-      } catch {
-        case NonFatal(e) =>
-          exitExecutor(1, "Unable to create executor due to " + e.getMessage, e)
+      myLog("kuofeng: RegisteredExecutor in backend. hostname: " + hostname)
+      if (hostname.equals("192.168.100.201")) {
+        // kuofeng
+        try {
+          executor = new Executor(executorId, hostname, env, userClassPath,
+            isLocal = false,
+            resources = _resources)
+          // NIC executor is invisible to driver
+          // driver.get.send(LaunchedExecutor(executorId))
+        } catch {
+          case NonFatal(e) =>
+            exitExecutor(1, "Unable to create executor due to " + e.getMessage, e)
+        }
+      } else {
+        try {
+          executor = new Executor(executorId, hostname, env, userClassPath,
+            isLocal = false,
+            resources = _resources)
+          driver.get.send(LaunchedExecutor(executorId))
+        } catch {
+          case NonFatal(e) =>
+            exitExecutor(1, "Unable to create executor due to " + e.getMessage, e)
+        }
       }
 
     case LaunchTask(data) =>
       // kuofeng
-      val file = new File("/home/kuofeng/myExecutorBackendLog-" + createdTime)
-      val bw = new BufferedWriter(new FileWriter(file, true))
-      bw.write(s"kuofeng: ExecutorBackend get a task to launch\n")
-      bw.close()
+      myLog("kuofeng: ExecutorBackend get a task to launch")
       if (executor == null) {
+        myLog("kuofeng: executor is null")
         exitExecutor(1, "Received LaunchTask command but executor was null")
       } else {
         if (decommissioned) {
+          myLog("kuofeng: executor is decommissioned")
           val msg = "Asked to launch a task while decommissioned."
           logError(msg)
           driver match {
@@ -198,6 +214,7 @@ private[spark] class CoarseGrainedExecutorBackend(
         val taskDesc = TaskDescription.decode(data.value)
         logInfo("Got assigned task " + taskDesc.taskId)
         taskResources(taskDesc.taskId) = taskDesc.resources
+        myLog("kuofeng: before executor launchTask")
         executor.launchTask(this, taskDesc)
       }
 
@@ -251,6 +268,7 @@ private[spark] class CoarseGrainedExecutorBackend(
     val resources = taskResources.getOrElse(taskId, Map.empty[String, ResourceInformation])
     val msg = StatusUpdate(executorId, taskId, state, data, resources)
     if (TaskState.isFinished(state)) {
+      myLog("kuofeng: Task finished")
       taskResources.remove(taskId)
     }
     driver match {
