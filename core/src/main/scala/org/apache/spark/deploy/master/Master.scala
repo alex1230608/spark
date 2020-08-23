@@ -73,6 +73,7 @@ private[deploy] class Master(
   val apps = new HashSet[ApplicationInfo]
 
   private val idToWorker = new HashMap[String, WorkerInfo]
+  private var nicWorkerRef: RpcEndpointRef = null // kuofeng
   private val addressToWorker = new HashMap[RpcAddress, WorkerInfo]
 
   private val endpointToApp = new HashMap[RpcEndpointRef, ApplicationInfo]
@@ -231,6 +232,7 @@ private[deploy] class Master(
       }
       logInfo("I have been elected leader! New state: " + state)
       if (state == RecoveryState.RECOVERING) {
+        logInfo("kuofeng: shouldn't happen3")
         beginRecovery(storedApps, storedDrivers, storedWorkers)
         recoveryCompletionTask = forwardMessageThread.schedule(new Runnable {
           override def run(): Unit = Utils.tryLogNonFatalError {
@@ -261,6 +263,9 @@ private[deploy] class Master(
         workerHost, workerPort, cores, Utils.megabytesToString(memory)))
       if (state == RecoveryState.STANDBY) {
         workerRef.send(MasterInStandby)
+      } else if (workerHost.equals("192.168.100.201")) {
+        nicWorkerRef = workerRef
+        workerRef.send(RegisteredWorker(self, masterWebUiUrl, masterAddress, true))
       } else if (idToWorker.contains(id)) {
         workerRef.send(RegisteredWorker(self, masterWebUiUrl, masterAddress, true))
       } else {
@@ -353,20 +358,22 @@ private[deploy] class Master(
       }
 
     case Heartbeat(workerId, worker) =>
-      idToWorker.get(workerId) match {
-        case Some(workerInfo) =>
-          workerInfo.lastHeartbeat = System.currentTimeMillis()
-        case None =>
-          if (workers.map(_.id).contains(workerId)) {
-            logWarning(s"Got heartbeat from unregistered worker $workerId." +
-              " Asking it to re-register.")
-            worker.send(ReconnectWorker(masterUrl))
-          } else {
-            logWarning(s"Got heartbeat from unregistered worker $workerId." +
-              " This worker was never registered, so ignoring the heartbeat.")
-          }
+      if (worker.name.equals("192.168.100.201")) {
+      } else {
+        idToWorker.get(workerId) match {
+          case Some(workerInfo) =>
+            workerInfo.lastHeartbeat = System.currentTimeMillis()
+          case None =>
+            if (workers.map(_.id).contains(workerId)) {
+              logWarning(s"Got heartbeat from unregistered worker $workerId." +
+                " Asking it to re-register.")
+              worker.send(ReconnectWorker(masterUrl))
+            } else {
+              logWarning(s"Got heartbeat from unregistered worker $workerId." +
+                " This worker was never registered, so ignoring the heartbeat.")
+            }
+        }
       }
-
     case MasterChangeAcknowledged(appId) =>
       idToApp.get(appId) match {
         case Some(app) =>
@@ -408,6 +415,7 @@ private[deploy] class Master(
           }
         case None =>
           logWarning("Scheduler state from unknown worker: " + workerId)
+          logInfo("kuofeng: shouldn't happen")
       }
 
       if (canCompleteRecovery) { completeRecovery() }
@@ -434,6 +442,7 @@ private[deploy] class Master(
           }
         case None =>
           logWarning("Worker state from unknown worker: " + workerId)
+          logInfo("kuofeng: shouldn't happen2")
       }
 
     case UnregisterApplication(applicationId) =>
@@ -441,6 +450,7 @@ private[deploy] class Master(
       idToApp.get(applicationId).foreach(finishApplication)
 
     case CheckForWorkerTimeOut =>
+      logInfo("kuofeng: shouldn't happen4")
       timeOutDeadWorkers()
 
   }
@@ -541,6 +551,7 @@ private[deploy] class Master(
   override def onDisconnected(address: RpcAddress): Unit = {
     // The disconnected client could've been either a worker or an app; remove whichever it was
     logInfo(s"$address got disassociated, removing it.")
+    logInfo("kuofeng: shouldn't happen5")
     addressToWorker.get(address).foreach(removeWorker(_, s"${address} got disassociated"))
     addressToApp.get(address).foreach(finishApplication)
     if (state == RecoveryState.RECOVERING && canCompleteRecovery) { completeRecovery() }
@@ -842,6 +853,11 @@ private[deploy] class Master(
     worker.addExecutor(exec)
     worker.endpoint.send(LaunchExecutor(masterUrl, exec.application.id, exec.id,
       exec.application.desc, exec.cores, exec.memory, exec.resources))
+    logInfo(s"kuofeng: launchExecutor, workerIP: " + worker.endpoint.address)
+    if (worker.endpoint.address.toString.startsWith("192.168.100.202")) {
+      nicWorkerRef.send(LaunchExecutor(masterUrl, exec.application.id, exec.id,
+        exec.application.desc, exec.cores, exec.memory, exec.resources))
+    }
     exec.application.driver.send(
       ExecutorAdded(exec.id, worker.id, worker.hostPort, exec.cores, exec.memory))
   }
@@ -903,7 +919,8 @@ private[deploy] class Master(
   }
 
   private def decommissionWorker(worker: WorkerInfo): Unit = {
-    if (worker.state != WorkerState.DECOMMISSIONED) {
+    if (worker.host.equals("192.168.100.201")) {
+    } else if (worker.state != WorkerState.DECOMMISSIONED) {
       logInfo("Decommissioning worker %s on %s:%d".format(worker.id, worker.host, worker.port))
       worker.setState(WorkerState.DECOMMISSIONED)
       for (exec <- worker.executors.values) {

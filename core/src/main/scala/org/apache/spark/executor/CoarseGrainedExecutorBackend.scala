@@ -17,7 +17,8 @@
 
 package org.apache.spark.executor
 
-import java.io.File
+// kuofeng: add two writter
+import java.io.{BufferedWriter, File, FileWriter}
 import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Locale
@@ -70,6 +71,9 @@ private[spark] class CoarseGrainedExecutorBackend(
   // to be changed so that we don't share the serializer instance across threads
   private[this] val ser: SerializerInstance = env.closureSerializer.newInstance()
 
+  // kuofeng
+  val createdTime = System.currentTimeMillis()
+
   private var _resources = Map.empty[String, ResourceInformation]
 
   /**
@@ -82,6 +86,12 @@ private[spark] class CoarseGrainedExecutorBackend(
   @volatile private var decommissioned = false
 
   override def onStart(): Unit = {
+    // kuofeng
+    val file = new File("/home/kuofeng/myExecutorBackendLog-" + createdTime)
+    val bw = new BufferedWriter(new FileWriter(file, true))
+    bw.write(s"kuofeng: executorBackend start\n")
+    bw.close()
+
     logInfo("Registering PWR handler.")
     SignalUtils.register("PWR", "Failed to register SIGPWR handler - " +
       "disabling decommission feature.")(decommissionSelf)
@@ -163,7 +173,11 @@ private[spark] class CoarseGrainedExecutorBackend(
       }
 
     case LaunchTask(data) =>
-      logInfo("kuofeng: ExecutorBackend get a task to launch")
+      // kuofeng
+      val file = new File("/home/kuofeng/myExecutorBackendLog-" + createdTime)
+      val bw = new BufferedWriter(new FileWriter(file, true))
+      bw.write(s"kuofeng: ExecutorBackend get a task to launch\n")
+      bw.close()
       if (executor == null) {
         exitExecutor(1, "Received LaunchTask command but executor was null")
       } else {
