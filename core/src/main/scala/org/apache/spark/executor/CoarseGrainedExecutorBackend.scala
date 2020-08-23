@@ -163,6 +163,7 @@ private[spark] class CoarseGrainedExecutorBackend(
       }
 
     case LaunchTask(data) =>
+      logInfo("kuofeng: ExecutorBackend get a task to launch")
       if (executor == null) {
         exitExecutor(1, "Received LaunchTask command but executor was null")
       } else {
