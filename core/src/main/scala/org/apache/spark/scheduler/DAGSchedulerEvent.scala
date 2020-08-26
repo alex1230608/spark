@@ -71,6 +71,19 @@ case class BeginEvent(task: Task[_], taskInfo: TaskInfo) extends DAGSchedulerEve
 private[scheduler]
 case class GettingResultEvent(taskInfo: TaskInfo) extends DAGSchedulerEvent
 
+// kuofeng
+private[scheduler] case class CompletionEvent2(
+    task: Task[_],
+    reason: TaskEndReason,
+    result: Any,
+    accumUpdates: Seq[AccumulatorV2[_, _]],
+    metricPeaks: Array[Long],
+    taskInfo: TaskInfo,
+    result2: Any,
+    accumUpdates2: Seq[AccumulatorV2[_, _]],
+    metricPeaks2: Array[Long])
+  extends DAGSchedulerEvent
+
 private[scheduler] case class CompletionEvent(
     task: Task[_],
     reason: TaskEndReason,

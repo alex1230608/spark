@@ -303,9 +303,30 @@ class HadoopRDD[K, V](
       private val key: K = if (reader == null) null.asInstanceOf[K] else reader.createKey()
       private val value: V = if (reader == null) null.asInstanceOf[V] else reader.createValue()
 
+      // kuofeng
+      private val threshold = 350000
+      private var count = 0
+      private val hostIp = System.getenv("SPARK_LOCAL_IP")
+
       override def getNext(): (K, V) = {
         try {
-          finished = !reader.next(key, value)
+          // kuofeng
+          if (hostIp.equals("192.168.100.201")) {
+            if (count < threshold) {
+              finished = !reader.next(key, value)
+              count = count + 1
+            } else {
+              finished = true
+            }
+          } else if (hostIp.equals("192.168.100.202")) {
+            while (!finished && count < threshold) {
+              finished = !reader.next(key, value)
+              count = count + 1
+            }
+            finished = !reader.next(key, value)
+          } else {
+            finished = !reader.next(key, value)
+          }
         } catch {
           case e: FileNotFoundException if ignoreMissingFiles =>
             logWarning(s"Skipped missing file: ${split.inputSplit}", e)

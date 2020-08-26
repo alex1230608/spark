@@ -717,6 +717,62 @@ private[spark] class TaskSetManager(
     }
   }
 
+  // kuofeng
+  /**
+   * Marks a task as successful and notifies the DAGScheduler that the task has ended.
+   */
+  def handleSuccessfulTask(tid: Long, result: DirectTaskResult[_],
+    result2: DirectTaskResult[_]): Unit = {
+    val info = taskInfos(tid)
+    val index = info.index
+    // Check if any other attempt succeeded before this and this attempt has not been handled
+    if (successful(index) && killedByOtherAttempt.contains(tid)) {
+      logError("kuofeng: killedByOther not handled")
+      System.exit(1)
+    }
+
+    info.markFinished(TaskState.FINISHED, clock.getTimeMillis())
+    if (speculationEnabled) {
+      successfulTaskDurations.insert(info.duration)
+    }
+    removeRunningTask(tid)
+
+    // Kill any other attempts for the same task (since those are unnecessary now that one
+    // attempt completed successfully).
+    for (attemptInfo <- taskAttempts(index) if attemptInfo.running) {
+      logInfo(s"Killing attempt ${attemptInfo.attemptNumber} for ${taskName(attemptInfo.taskId)}" +
+        s" on ${attemptInfo.host} as the attempt ${info.attemptNumber} succeeded on ${info.host}")
+      killedByOtherAttempt += attemptInfo.taskId
+      sched.backend.killTask(
+        attemptInfo.taskId,
+        attemptInfo.executorId,
+        interruptThread = true,
+        reason = "another attempt succeeded")
+    }
+    if (!successful(index)) {
+      tasksSuccessful += 1
+      logInfo(s"Finished ${taskName(info.taskId)} in ${info.duration} ms " +
+        s"on ${info.host} (executor ${info.executorId}) ($tasksSuccessful/$numTasks)")
+      // Mark successful and stop if all the tasks have succeeded.
+      successful(index) = true
+      if (tasksSuccessful == numTasks) {
+        isZombie = true
+      }
+    } else {
+      logInfo(s"Ignoring task-finished event for ${taskName(info.taskId)} " +
+        s"because it has already completed successfully")
+    }
+    // This method is called by "TaskSchedulerImpl.handleSuccessfulTask" which holds the
+    // "TaskSchedulerImpl" lock until exiting. To avoid the SPARK-7655 issue, we should not
+    // "deserialize" the value when holding a lock to avoid blocking other threads. So we call
+    // "result.value()" in "TaskResultGetter.enqueueSuccessfulTask" before reaching here.
+    // Note: "result.value()" only deserializes the value when it's called at the first time, so
+    // here "result.value()" just returns the value and won't block other threads.
+    sched.dagScheduler.taskEnded(tasks(index), Success, result.value(), result.accumUpdates,
+      result.metricPeaks, info, result2.value(), result2.accumUpdates, result2.metricPeaks)
+    maybeFinishTaskSet()
+  }
+
   /**
    * Marks a task as successful and notifies the DAGScheduler that the task has ended.
    */

@@ -54,6 +54,112 @@ private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedul
     }
   }
 
+  // kuofeng
+  def enqueueSuccessfulTask(
+      taskSetManager: TaskSetManager,
+      tid: Long,
+      serializedData: ByteBuffer,
+      serializedData2: ByteBuffer): Unit = {
+    getTaskResultExecutor.execute(new Runnable {
+      override def run(): Unit = Utils.logUncaughtExceptions {
+        try {
+          val (result, size) = serializer.get().deserialize[TaskResult[_]](serializedData) match {
+            case directResult: DirectTaskResult[_] =>
+              if (!taskSetManager.canFetchMoreResults(serializedData.limit())) {
+                logError("kuofeng: failure handling not supported")
+                System.exit(1)
+              }
+              // deserialize "value" without holding any lock so that it won't block other threads.
+              // We should call it here, so that when it's called again in
+              // "TaskSetManager.handleSuccessfulTask", it does not need to deserialize the value.
+              directResult.value(taskResultSerializer.get())
+              (directResult, serializedData.limit())
+            case IndirectTaskResult(blockId, size) =>
+              if (!taskSetManager.canFetchMoreResults(size)) {
+                logError("kuofeng: failure handling not supported")
+                System.exit(1)
+              }
+              logDebug(s"Fetching indirect task result for ${taskSetManager.taskName(tid)}")
+              val serializedTaskResult = sparkEnv.blockManager.getRemoteBytes(blockId)
+              if (serializedTaskResult.isEmpty) {
+                logError("kuofeng: failure handling not supported")
+                System.exit(1)
+              }
+              val deserializedResult = serializer.get().deserialize[DirectTaskResult[_]](
+                serializedTaskResult.get.toByteBuffer)
+              // force deserialization of referenced value
+              deserializedResult.value(taskResultSerializer.get())
+              sparkEnv.blockManager.master.removeBlock(blockId)
+              (deserializedResult, size)
+          }
+          val (result2, size2) = serializer.get()
+            .deserialize[TaskResult[_]](serializedData2) match {
+            case directResult: DirectTaskResult[_] =>
+              if (!taskSetManager.canFetchMoreResults(serializedData2.limit())) {
+                logError("kuofeng: failure handling not supported")
+                System.exit(1)
+              }
+              // deserialize "value" without holding any lock so that it won't block other threads.
+              // We should call it here, so that when it's called again in
+              // "TaskSetManager.handleSuccessfulTask", it does not need to deserialize the value.
+              directResult.value(taskResultSerializer.get())
+              (directResult, serializedData2.limit())
+            case IndirectTaskResult(blockId, size) =>
+              if (!taskSetManager.canFetchMoreResults(size)) {
+                logError("kuofeng: failure handling not supported")
+                System.exit(1)
+              }
+              logDebug(s"Fetching indirect task result for ${taskSetManager.taskName(tid)}")
+              val serializedTaskResult = sparkEnv.blockManager.getRemoteBytes(blockId)
+              if (serializedTaskResult.isEmpty) {
+                logError("kuofeng: failure handling not supported")
+                System.exit(1)
+              }
+              val deserializedResult = serializer.get().deserialize[DirectTaskResult[_]](
+                serializedTaskResult.get.toByteBuffer)
+              // force deserialization of referenced value
+              deserializedResult.value(taskResultSerializer.get())
+              sparkEnv.blockManager.master.removeBlock(blockId)
+              (deserializedResult, size)
+          }
+          // Set the task result size in the accumulator updates received from the executors.
+          // We need to do this here on the driver because if we did this on the executors then
+          // we would have to serialize the result again after updating the size.
+          result.accumUpdates = result.accumUpdates.map { a =>
+            if (a.name == Some(InternalAccumulator.RESULT_SIZE)) {
+              val acc = a.asInstanceOf[LongAccumulator]
+              assert(acc.sum == 0L, "task result size should not have been set on the executors")
+              acc.setValue(size.toLong)
+              acc
+            } else {
+              a
+            }
+          }
+          result2.accumUpdates = result2.accumUpdates.map { a =>
+            if (a.name == Some(InternalAccumulator.RESULT_SIZE)) {
+              val acc = a.asInstanceOf[LongAccumulator]
+              assert(acc.sum == 0L, "task result size should not have been set on the executors")
+              acc.setValue(size.toLong)
+              acc
+            } else {
+              a
+            }
+          }
+
+          scheduler.handleSuccessfulTask(taskSetManager, tid, result, result2)
+        } catch {
+          case cnf: ClassNotFoundException =>
+            val loader = Thread.currentThread.getContextClassLoader
+            taskSetManager.abort("ClassNotFound with classloader: " + loader)
+          // Matching NonFatal so we don't catch the ControlThrowable from the "return" above.
+          case NonFatal(ex) =>
+            logError("Exception while getting task result", ex)
+            taskSetManager.abort("Exception while getting task result: %s".format(ex))
+        }
+      }
+    })
+  }
+
   def enqueueSuccessfulTask(
       taskSetManager: TaskSetManager,
       tid: Long,

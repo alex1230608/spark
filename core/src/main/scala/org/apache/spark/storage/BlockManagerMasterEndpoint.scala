@@ -54,6 +54,11 @@ class BlockManagerMasterEndpoint(
     mapOutputTracker: MapOutputTrackerMaster)
   extends IsolatedRpcEndpoint with Logging {
 
+  // kuofeng
+  var nicBlockManagerInfo: BlockManagerInfo = null
+  var nicBlockManagerId: BlockManagerId = null
+  var nicLocalDirs: Array[String] = null
+
   // Mapping from executor id to the block manager's local disk directories.
   private val executorIdToLocalDirs =
     CacheBuilder
@@ -251,17 +256,24 @@ class BlockManagerMasterEndpoint(
         }
       }
       bmIdsExecutor.foreach { bmId =>
-        blockManagerInfo.get(bmId).foreach { bmInfo =>
-          bmInfo.removeBlock(blockId)
+        // kuofeng
+        if (bmId.host.equals("192.168.100.201")) {
+          nicBlockManagerInfo.removeBlock(blockId)
+        } else {
+          blockManagerInfo.get(bmId).foreach { bmInfo =>
+            bmInfo.removeBlock(blockId)
+          }
         }
       }
     }
-    val removeRddFromExecutorsFutures = blockManagerInfo.values.map { bmInfo =>
-      bmInfo.storageEndpoint.ask[Int](removeMsg).recover {
-        // use 0 as default value means no blocks were removed
-        handleBlockRemovalFailure("RDD", rddId.toString, bmInfo.blockManagerId, 0)
-      }
-    }.toSeq
+    val removeRddFromExecutorsFutures =
+      ((blockManagerInfo.values) ++ Seq(nicBlockManagerInfo)) // kuofeng
+      .map { bmInfo =>
+        bmInfo.storageEndpoint.ask[Int](removeMsg).recover {
+          // use 0 as default value means no blocks were removed
+          handleBlockRemovalFailure("RDD", rddId.toString, bmInfo.blockManagerId, 0)
+        }
+      }.toSeq
 
     val removeRddBlockViaExtShuffleServiceFutures = externalBlockStoreClient.map { shuffleClient =>
       blocksToDeleteByShuffleService.map { case (bmId, blockIds) =>
@@ -282,12 +294,13 @@ class BlockManagerMasterEndpoint(
     // Nothing to do in the BlockManagerMasterEndpoint data structures
     val removeMsg = RemoveShuffle(shuffleId)
     Future.sequence(
-      blockManagerInfo.values.map { bm =>
-        bm.storageEndpoint.ask[Boolean](removeMsg).recover {
-          // use false as default value means no shuffle data were removed
-          handleBlockRemovalFailure("shuffle", shuffleId.toString, bm.blockManagerId, false)
-        }
-      }.toSeq
+      ((blockManagerInfo.values) ++ Seq(nicBlockManagerInfo)) // kuofeng
+        .map { bm =>
+          bm.storageEndpoint.ask[Boolean](removeMsg).recover {
+            // use false as default value means no shuffle data were removed
+            handleBlockRemovalFailure("shuffle", shuffleId.toString, bm.blockManagerId, false)
+          }
+        }.toSeq
     )
   }
 
@@ -298,7 +311,9 @@ class BlockManagerMasterEndpoint(
    */
   private def removeBroadcast(broadcastId: Long, removeFromDriver: Boolean): Future[Seq[Int]] = {
     val removeMsg = RemoveBroadcast(broadcastId, removeFromDriver)
-    val requiredBlockManagers = blockManagerInfo.values.filter { info =>
+    val requiredBlockManagers =
+      ((blockManagerInfo.values) ++ Seq(nicBlockManagerInfo)) // kuofeng
+      .filter { info =>
       removeFromDriver || !info.blockManagerId.isDriver
     }
     val futures = requiredBlockManagers.map { bm =>
@@ -312,6 +327,41 @@ class BlockManagerMasterEndpoint(
   }
 
   private def removeBlockManager(blockManagerId: BlockManagerId): Unit = {
+    // kuofeng
+    if (blockManagerId.host.equals("192.168.100.202")) {
+      val iterator = nicBlockManagerInfo.blocks.keySet.iterator
+      while (iterator.hasNext) {
+        val blockId = iterator.next
+        val locations = blockLocations.get(blockId)
+        locations -= nicBlockManagerId
+        // De-register the block if none of the block managers have it. Otherwise, if pro-active
+        // replication is enabled, and a block is either an RDD or a test block (the latter is used
+        // for unit testing), we send a message to a randomly chosen executor location to replicate
+        // the given block. Note that we ignore other block types (such as broadcast/shuffle blocks
+        // etc.) as replication doesn't make much sense in that context.
+        if (locations.size == 0) {
+          blockLocations.remove(blockId)
+          logWarning(s"No more replicas available for $blockId !")
+        } else if (proactivelyReplicate && (blockId.isRDD || blockId.isInstanceOf[TestBlockId])) {
+          // As a heursitic, assume single executor failure to find out the number of replicas that
+          // existed before failure
+          logInfo("kuofeng: replicate happens when removing nicBlockManager")
+          val maxReplicas = locations.size + 1
+          val i = (new Random(blockId.hashCode)).nextInt(locations.size)
+          val blockLocations = locations.toSeq
+          val candidateBMId = blockLocations(i)
+          blockManagerInfo.get(candidateBMId).foreach { bm =>
+            val remainingLocations = locations.toSeq.filter(bm => bm != candidateBMId)
+            val replicateMsg = ReplicateBlock(blockId, remainingLocations, maxReplicas)
+            bm.storageEndpoint.ask[Boolean](replicateMsg)
+          }
+        }
+      }
+
+      nicBlockManagerId = null
+      nicBlockManagerInfo = null
+    }
+
     val info = blockManagerInfo(blockManagerId)
 
     // Remove the block manager from blockManagerIdByExecutor.
@@ -341,10 +391,18 @@ class BlockManagerMasterEndpoint(
         val i = (new Random(blockId.hashCode)).nextInt(locations.size)
         val blockLocations = locations.toSeq
         val candidateBMId = blockLocations(i)
-        blockManagerInfo.get(candidateBMId).foreach { bm =>
+        // kuofeng
+        if (candidateBMId == nicBlockManagerId) {
+          val bm = nicBlockManagerInfo
           val remainingLocations = locations.toSeq.filter(bm => bm != candidateBMId)
           val replicateMsg = ReplicateBlock(blockId, remainingLocations, maxReplicas)
           bm.storageEndpoint.ask[Boolean](replicateMsg)
+        } else {
+          blockManagerInfo.get(candidateBMId).foreach { bm =>
+            val remainingLocations = locations.toSeq.filter(bm => bm != candidateBMId)
+            val replicateMsg = ReplicateBlock(blockId, remainingLocations, maxReplicas)
+            bm.storageEndpoint.ask[Boolean](replicateMsg)
+          }
         }
       }
     }
@@ -365,11 +423,22 @@ class BlockManagerMasterEndpoint(
    *    - Sends the DecommissionBlockManager message to each of the [[BlockManagerReplicaEndpoint]]
    */
   def decommissionBlockManagers(blockManagerIds: Seq[BlockManagerId]): Future[Seq[Unit]] = {
-    val newBlockManagersToDecommission = blockManagerIds.toSet.diff(decommissioningBlockManagerSet)
+    // kuofeng
+    val nicAddedBMIds =
+      if (blockManagerIds.find( bmId => bmId.host.equals("192.168.100.202") ) != None) {
+        blockManagerIds :+ nicBlockManagerId
+      } else {
+        blockManagerIds
+      }
+    val newBlockManagersToDecommission = nicAddedBMIds.toSet.diff(decommissioningBlockManagerSet)
     val futures = newBlockManagersToDecommission.map { blockManagerId =>
       decommissioningBlockManagerSet.add(blockManagerId)
       val info = blockManagerInfo(blockManagerId)
       info.storageEndpoint.ask[Unit](DecommissionBlockManager)
+      // // kuofeng
+      // if (blockManagerId.host.equals("192.168.100.202")) {
+      //   nicBlockManagerInfo.storageEndpoint.ask[Unit](DecommissionBlockManager)
+      // }
     }
     Future.sequence{ futures.toSeq }
   }
@@ -398,7 +467,12 @@ class BlockManagerMasterEndpoint(
     val locations = blockLocations.get(blockId)
     if (locations != null) {
       locations.foreach { blockManagerId: BlockManagerId =>
-        val blockManager = blockManagerInfo.get(blockManagerId)
+        val blockManager =
+          if (blockManagerId.host.equals("192.168.100.201")) { // kuofeng
+            Option(nicBlockManagerInfo)
+          } else {
+            blockManagerInfo.get(blockManagerId)
+          }
         blockManager.foreach { bm =>
           // Remove the block from the BlockManager.
           // Doesn't actually wait for a confirmation and the message might get lost.
@@ -437,6 +511,8 @@ class BlockManagerMasterEndpoint(
   private def blockStatus(
       blockId: BlockId,
       askStorageEndpoints: Boolean): Map[BlockManagerId, Future[Option[BlockStatus]]] = {
+    logError("kuofeng: not supported blockStatus")
+    System.exit(1)
     val getBlockStatus = GetBlockStatus(blockId)
     /*
      * Rather than blocking on the block status query, master endpoint should simply return
@@ -465,6 +541,8 @@ class BlockManagerMasterEndpoint(
   private def getMatchingBlockIds(
       filter: BlockId => Boolean,
       askStorageEndpoints: Boolean): Future[Seq[BlockId]] = {
+    logError("kuofeng: not supported getMatchingBlockIds")
+    System.exit(1)
     val getMatchingBlockIds = GetMatchingBlockIds(filter)
     Future.sequence(
       blockManagerInfo.values.map { info =>
@@ -501,6 +579,27 @@ class BlockManagerMasterEndpoint(
       idWithoutTopologyInfo.host,
       idWithoutTopologyInfo.port,
       topologyMapper.getTopologyForHost(idWithoutTopologyInfo.host))
+
+    // kuofeng
+    if (id.host.equals("192.168.100.201")) {
+      // do nothing, let host's BlockManager be the only one
+      // but still return the result to make NIC believe it's working
+      nicLocalDirs = localDirs
+      nicBlockManagerId = id
+      val externalShuffleServiceBlockStatus =
+        if (externalShuffleServiceRddFetchEnabled) {
+          val externalShuffleServiceBlocks = blockStatusByShuffleService
+            .getOrElseUpdate(externalShuffleServiceIdOnHost(id), new JHashMap[BlockId, BlockStatus])
+          Some(externalShuffleServiceBlocks)
+        } else {
+          None
+        }
+
+      nicBlockManagerInfo = new BlockManagerInfo(id, System.currentTimeMillis(),
+        maxOnHeapMemSize, maxOffHeapMemSize, storageEndpoint, externalShuffleServiceBlockStatus)
+
+      return id
+    }
 
     val time = System.currentTimeMillis()
     executorIdToLocalDirs.put(id.executorId, localDirs)
@@ -559,6 +658,8 @@ class BlockManagerMasterEndpoint(
           return false
       }
     }
+
+    logInfo("kuofeng: more blocks other than shuffle are stored on NIC")
 
     if (!blockManagerInfo.contains(blockManagerId)) {
       if (blockManagerId.isDriver && !isLocal) {
@@ -619,7 +720,12 @@ class BlockManagerMasterEndpoint(
       if (externalShuffleServiceRddFetchEnabled && bmId.port == externalShuffleServicePort) {
         Option(blockStatusByShuffleService(bmId).get(blockId))
       } else {
-        blockManagerInfo.get(bmId).flatMap(_.getStatus(blockId))
+        // kuofeng
+        if (bmId.host.equals("192.168.100.201")) {
+          Option(nicBlockManagerInfo).flatMap(_.getStatus(blockId))
+        } else {
+          blockManagerInfo.get(bmId).flatMap(_.getStatus(blockId))
+        }
       }
     }
 
@@ -628,13 +734,28 @@ class BlockManagerMasterEndpoint(
         // When the external shuffle service running on the same host is found among the block
         // locations then the block must be persisted on the disk. In this case the executorId
         // can be used to access this block even when the original executor is already stopped.
-        loc.host == requesterHost &&
-          (loc.port == externalShuffleServicePort ||
-            blockManagerInfo
-              .get(loc)
-              .flatMap(_.getStatus(blockId).map(_.storageLevel.useDisk))
-              .getOrElse(false))
-      }.flatMap { bmId => Option(executorIdToLocalDirs.getIfPresent(bmId.executorId)) }
+        if (loc.host.equals("192.168.100.201")) { // kuofeng
+          loc.host == requesterHost &&
+            (loc.port == externalShuffleServicePort ||
+              Option(nicBlockManagerInfo)
+                .flatMap(_.getStatus(blockId).map(_.storageLevel.useDisk))
+                .getOrElse(false))
+        } else {
+          loc.host == requesterHost &&
+            (loc.port == externalShuffleServicePort ||
+              blockManagerInfo
+                .get(loc)
+                .flatMap(_.getStatus(blockId).map(_.storageLevel.useDisk))
+                .getOrElse(false))
+        }
+      }.flatMap { bmId =>
+        // kuofeng: locations should have the right mapping considering nic and host
+        if (bmId.host.equals("192.168.100.201")) {
+          Option(nicLocalDirs)
+        } else {
+          Option(executorIdToLocalDirs.getIfPresent(bmId.executorId))
+        }
+      }
       Some(BlockLocationsAndStatus(locations, status.get, localDirs))
     } else {
       None
@@ -648,7 +769,7 @@ class BlockManagerMasterEndpoint(
 
   /** Get the list of the peers of the given block manager */
   private def getPeers(blockManagerId: BlockManagerId): Seq[BlockManagerId] = {
-    val blockManagerIds = blockManagerInfo.keySet
+    val blockManagerIds = ((blockManagerInfo.keySet) + (nicBlockManagerId)) // kuofeng
     if (blockManagerIds.contains(blockManagerId)) {
       blockManagerIds
         .filterNot { _.isDriver }
@@ -664,6 +785,9 @@ class BlockManagerMasterEndpoint(
    * Returns an [[RpcEndpointRef]] of the [[BlockManagerReplicaEndpoint]] for sending RPC messages.
    */
   private def getExecutorEndpointRef(executorId: String): Option[RpcEndpointRef] = {
+    // kuofeng
+    logError("kuofeng: not supported")
+    System.exit(1)
     for (
       blockManagerId <- blockManagerIdByExecutor.get(executorId);
       info <- blockManagerInfo.get(blockManagerId)

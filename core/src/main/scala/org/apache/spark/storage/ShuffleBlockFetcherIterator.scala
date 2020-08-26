@@ -294,7 +294,8 @@ final class ShuffleBlockFetcherIterator(
       blockManager.hostLocalDirManager != null && blockManager.hostLocalDirManager.isDefined
 
     for ((address, blockInfos) <- blocksByAddress) {
-      if (address.executorId == blockManager.blockManagerId.executorId) {
+      if (address.executorId == blockManager.blockManagerId.executorId
+        && address.host.equals(blockManager.blockManagerId.host)) { // kuofeng
         checkBlockSizes(blockInfos)
         val mergedBlockInfos = mergeContinuousShuffleBlockIdsIfNeeded(
           blockInfos.map(info => FetchBlockInfo(info._1, info._2, info._3)), doBatchFetch)

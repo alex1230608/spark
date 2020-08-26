@@ -155,7 +155,7 @@ private[spark] class CoarseGrainedExecutorBackend(
   }
 
   def myLog(s: String): Unit = {
-    val file = new File("/home/kuofeng/myExecutorBackendLog-" + createdTime)
+    val file = new File("/home/kuofeng/myLog/myExecutorBackendLog-" + createdTime)
     val bw = new BufferedWriter(new FileWriter(file, true))
     bw.write(s + "\n")
     bw.close()

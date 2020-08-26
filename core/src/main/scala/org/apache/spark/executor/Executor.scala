@@ -419,7 +419,7 @@ private[spark] class Executor(
 
     // kuofeng
     def myLog(s: String): Unit = {
-      val file = new File("/home/kuofeng/myTaskRunnerLog-" + createdTime)
+      val file = new File("/home/kuofeng/myLog/myTaskRunnerLog-" + createdTime)
       val bw = new BufferedWriter(new FileWriter(file, true))
       bw.write(s + "\n")
       bw.close()
@@ -605,11 +605,13 @@ private[spark] class Executor(
         // directSend = sending directly back to the driver
         val serializedResult: ByteBuffer = {
           if (maxResultSize > 0 && resultSize > maxResultSize) {
+            myLog("kuofeng: (runTask) Result size too large")
             logWarning(s"Finished $taskName. Result is larger than maxResultSize " +
               s"(${Utils.bytesToString(resultSize)} > ${Utils.bytesToString(maxResultSize)}), " +
               s"dropping it.")
             ser.serialize(new IndirectTaskResult[Any](TaskResultBlockId(taskId), resultSize))
           } else if (resultSize > maxDirectResultSize) {
+            myLog("kuofeng: (runTask) Result size large enough for block")
             val blockId = TaskResultBlockId(taskId)
             env.blockManager.putBytes(
               blockId,
@@ -618,6 +620,7 @@ private[spark] class Executor(
             logInfo(s"Finished $taskName. $resultSize bytes result sent via BlockManager)")
             ser.serialize(new IndirectTaskResult[Any](blockId, resultSize))
           } else {
+            myLog("kuofeng: (runTask) Result size small enough to be directly sent")
             logInfo(s"Finished $taskName. $resultSize bytes result sent to driver")
             serializedDirectResult
           }

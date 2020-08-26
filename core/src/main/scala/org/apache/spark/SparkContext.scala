@@ -666,6 +666,9 @@ class SparkContext(config: SparkConf) extends Logging {
    * dump message back to the driver.
    */
   private[spark] def getExecutorThreadDump(executorId: String): Option[Array[ThreadStackTrace]] = {
+    // kuofeng
+    logError("kuofeng: not supported")
+    System.exit(1)
     try {
       if (executorId == SparkContext.DRIVER_IDENTIFIER) {
         Some(Utils.getThreadDump())

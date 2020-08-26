@@ -752,7 +752,10 @@ private[spark] class TaskSchedulerImpl(
     Random.shuffle(offers)
   }
 
-  def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer): Unit = {
+  // kuofeng
+  def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer,
+    serializedData2: ByteBuffer): Unit = {
+    // halfFinished: Boolean): Unit = { // kuofeng
     var failedExecutor: Option[String] = None
     var reason: Option[ExecutorLossReason] = None
     synchronized {
@@ -777,6 +780,66 @@ private[spark] class TaskSchedulerImpl(
               }
             }
             if (TaskState.isFinished(state)) {
+              // // kuofeng
+              // if (!halfFinished) {}
+              cleanupTaskState(tid)
+              taskSet.removeRunningTask(tid)
+              if (state == TaskState.FINISHED) {
+                taskResultGetter.enqueueSuccessfulTask(taskSet, tid,
+                  serializedData, serializedData2)
+              } else if (Set(TaskState.FAILED, TaskState.KILLED, TaskState.LOST).contains(state)) {
+                logError("kuofeng: shouldn't get not FINISHED state for nic+host case")
+                taskResultGetter.enqueueFailedTask(taskSet, tid, state, serializedData)
+                // only give it the first data
+              }
+            }
+          case None =>
+            logError(
+              ("Ignoring update with state %s for TID %s because its task set is gone (this is " +
+                "likely the result of receiving duplicate task finished status updates) or its " +
+                "executor has been marked as failed.")
+                .format(state, tid))
+        }
+      } catch {
+        case e: Exception => logError("Exception in statusUpdate", e)
+      }
+    }
+    // Update the DAGScheduler without holding a lock on this, since that can deadlock
+    if (failedExecutor.isDefined) {
+      assert(reason.isDefined)
+      dagScheduler.executorLost(failedExecutor.get, reason.get)
+      backend.reviveOffers()
+    }
+  }
+
+  def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer): Unit = {
+    // halfFinished: Boolean): Unit = { // kuofeng
+    var failedExecutor: Option[String] = None
+    var reason: Option[ExecutorLossReason] = None
+    synchronized {
+      try {
+        Option(taskIdToTaskSetManager.get(tid)) match {
+          case Some(taskSet) =>
+            if (state == TaskState.LOST) {
+              // TaskState.LOST is only used by the deprecated Mesos fine-grained scheduling mode,
+              // where each executor corresponds to a single task, so mark the executor as failed.
+              val execId = taskIdToExecutorId.getOrElse(tid, {
+                val errorMsg =
+                  "taskIdToTaskSetManager.contains(tid) <=> taskIdToExecutorId.contains(tid)"
+                taskSet.abort(errorMsg)
+                throw new SparkException(errorMsg)
+              })
+              if (executorIdToRunningTaskIds.contains(execId)) {
+                reason = Some(
+                  ExecutorProcessLost(
+                    s"Task $tid was lost, so marking the executor as lost as well."))
+                removeExecutor(execId, reason.get)
+                failedExecutor = Some(execId)
+              }
+            }
+            if (TaskState.isFinished(state)) {
+              // // kuofeng
+              // if (!halfFinished) {}
               cleanupTaskState(tid)
               taskSet.removeRunningTask(tid)
               if (state == TaskState.FINISHED) {
@@ -829,6 +892,15 @@ private[spark] class TaskSchedulerImpl(
 
   def handleTaskGettingResult(taskSetManager: TaskSetManager, tid: Long): Unit = synchronized {
     taskSetManager.handleTaskGettingResult(tid)
+  }
+
+  // kuofeng
+  def handleSuccessfulTask(
+      taskSetManager: TaskSetManager,
+      tid: Long,
+      taskResult: DirectTaskResult[_],
+      taskResult2: DirectTaskResult[_]): Unit = synchronized {
+    taskSetManager.handleSuccessfulTask(tid, taskResult, taskResult2)
   }
 
   def handleSuccessfulTask(

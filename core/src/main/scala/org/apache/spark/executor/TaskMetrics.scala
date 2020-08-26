@@ -309,6 +309,36 @@ private[spark] object TaskMetrics extends Logging {
     tm
   }
 
+  // kuofeng
+  /**
+   * Construct a [[TaskMetrics]] object from a list of accumulator updates, called on driver only.
+   */
+  def fromAccumulators(accums: Seq[AccumulatorV2[_, _]],
+    accums2: Seq[AccumulatorV2[_, _]]): TaskMetrics = {
+    val tm = new TaskMetrics
+    for (acc <- accums) {
+      val name = acc.name
+      if (name.isDefined && tm.nameToAccums.contains(name.get)) {
+        val tmAcc = tm.nameToAccums(name.get).asInstanceOf[AccumulatorV2[Any, Any]]
+        tmAcc.metadata = acc.metadata
+        tmAcc.merge(acc.asInstanceOf[AccumulatorV2[Any, Any]])
+      } else {
+        tm.externalAccums += acc
+      }
+    }
+    for (acc <- accums2) {
+      val name = acc.name
+      if (name.isDefined && tm.nameToAccums.contains(name.get)) {
+        val tmAcc = tm.nameToAccums(name.get).asInstanceOf[AccumulatorV2[Any, Any]]
+        tmAcc.metadata = acc.metadata
+        tmAcc.merge(acc.asInstanceOf[AccumulatorV2[Any, Any]])
+      } else {
+        tm.externalAccums += acc
+      }
+    }
+    tm
+  }
+
   /**
    * Construct a [[TaskMetrics]] object from a list of accumulator updates, called on driver only.
    */

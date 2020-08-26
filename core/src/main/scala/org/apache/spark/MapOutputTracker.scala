@@ -84,7 +84,7 @@ private class ShuffleStatus(numPartitions: Int) extends Logging {
    * for each output.
    */
   // Exposed for testing
-  val mapStatuses = new Array[MapStatus](numPartitions)
+  val mapStatuses = new Array[(MapStatus, MapStatus)](numPartitions) // kuofeng
 
   /**
    * The cached result of serializing the map statuses array. This cache is lazily populated when
@@ -113,23 +113,40 @@ private class ShuffleStatus(numPartitions: Int) extends Logging {
    * Register a map output. If there is already a registered location for the map output then it
    * will be replaced by the new location.
    */
-  def addMapOutput(mapIndex: Int, status: MapStatus): Unit = withWriteLock {
+  def addMapOutput(mapIndex: Int, status: MapStatus,
+    status2: MapStatus = null): Unit = withWriteLock { // kuofeng
+    val (nicStatus, hostStatus): (MapStatus, MapStatus) =
+      if (status2 == null) {
+        (status2, status)
+      } else if (status.location.host.equals("192.168.100.201")) {
+        (status, status2)
+      } else if (status2.location.host.equals("192.168.100.201")) {
+        (status2, status)
+      } else {
+        logError("kuofeng: at least one of them should be from nic")
+        System.exit(1)
+        (status, status2)
+      }
     if (mapStatuses(mapIndex) == null) {
       _numAvailableOutputs += 1
       invalidateSerializedMapOutputStatusCache()
     }
-    mapStatuses(mapIndex) = status
+    mapStatuses(mapIndex) = (hostStatus, nicStatus) // kuofeng
   }
 
   /**
    * Update the map output location (e.g. during migration).
    */
   def updateMapOutput(mapId: Long, bmAddress: BlockManagerId): Unit = withWriteLock {
-    val mapStatusOpt = mapStatuses.find(_.mapId == mapId)
+    // kuofeng
+    logError("kuofeng: updateMapOutput not supported yet")
+    System.exit(1)
+    val mapStatusOpt = mapStatuses.find(_._1.mapId == mapId)
     mapStatusOpt match {
-      case Some(mapStatus) =>
+      case Some((mapStatus, mapStatus2)) =>
         logInfo(s"Updating map output for ${mapId} to ${bmAddress}")
         mapStatus.updateLocation(bmAddress)
+        // kuofeng: mapStatus2 should be updated too
         invalidateSerializedMapOutputStatusCache()
       case None =>
         logError(s"Asked to update map output ${mapId} for untracked map status.")
@@ -143,7 +160,7 @@ private class ShuffleStatus(numPartitions: Int) extends Logging {
    */
   def removeMapOutput(mapIndex: Int, bmAddress: BlockManagerId): Unit = withWriteLock {
     logDebug(s"Removing existing map output ${mapIndex} ${bmAddress}")
-    if (mapStatuses(mapIndex) != null && mapStatuses(mapIndex).location == bmAddress) {
+    if (mapStatuses(mapIndex) != null && mapStatuses(mapIndex)._1.location == bmAddress) {
       _numAvailableOutputs -= 1
       mapStatuses(mapIndex) = null
       invalidateSerializedMapOutputStatusCache()
@@ -175,7 +192,7 @@ private class ShuffleStatus(numPartitions: Int) extends Logging {
    */
   def removeOutputsByFilter(f: BlockManagerId => Boolean): Unit = withWriteLock {
     for (mapIndex <- mapStatuses.indices) {
-      if (mapStatuses(mapIndex) != null && f(mapStatuses(mapIndex).location)) {
+      if (mapStatuses(mapIndex) != null && f(mapStatuses(mapIndex)._1.location)) {
         _numAvailableOutputs -= 1
         mapStatuses(mapIndex) = null
         invalidateSerializedMapOutputStatusCache()
@@ -245,7 +262,7 @@ private class ShuffleStatus(numPartitions: Int) extends Logging {
    * Helper function which provides thread-safe access to the mapStatuses array.
    * The function should NOT mutate the array.
    */
-  def withMapStatuses[T](f: Array[MapStatus] => T): T = withReadLock {
+  def withMapStatuses[T](f: Array[(MapStatus, MapStatus)] => T): T = withReadLock {
     f(mapStatuses)
   }
 
@@ -478,12 +495,16 @@ private[spark] class MapOutputTrackerMaster(
   }
 
   def registerShuffle(shuffleId: Int, numMaps: Int): Unit = {
+    logInfo("kuofeng: registerShuffle for shuffleId: " + shuffleId +
+      " with numMaps: " + numMaps)
     if (shuffleStatuses.put(shuffleId, new ShuffleStatus(numMaps)).isDefined) {
       throw new IllegalArgumentException("Shuffle ID " + shuffleId + " registered twice")
     }
   }
 
   def updateMapOutput(shuffleId: Int, mapId: Long, bmAddress: BlockManagerId): Unit = {
+    logInfo("kuofeng: updateMapOutput for mapId: " + mapId +
+      " from manager: " + bmAddress)
     shuffleStatuses.get(shuffleId) match {
       case Some(shuffleStatus) =>
         shuffleStatus.updateMapOutput(mapId, bmAddress)
@@ -492,7 +513,17 @@ private[spark] class MapOutputTrackerMaster(
     }
   }
 
+  // kuofeng
+  def registerMapOutput(shuffleId: Int, mapIndex: Int, status: MapStatus,
+    status2: MapStatus): Unit = {
+    logInfo("kuofeng: registerMapOutput for mapId: " + mapIndex +
+      " from manager: " + status.location + " and " + status2.location)
+    shuffleStatuses(shuffleId).addMapOutput(mapIndex, status, status2)
+  }
+
   def registerMapOutput(shuffleId: Int, mapIndex: Int, status: MapStatus): Unit = {
+    logInfo("kuofeng: registerMapOutput for mapId: " + mapIndex +
+      " from manager: " + status.location)
     shuffleStatuses(shuffleId).addMapOutput(mapIndex, status)
   }
 
@@ -603,7 +634,10 @@ private[spark] class MapOutputTrackerMaster(
       if (parallelism <= 1) {
         for (s <- statuses) {
           for (i <- 0 until totalSizes.length) {
-            totalSizes(i) += s.getSizeForBlock(i)
+            totalSizes(i) += s._1.getSizeForBlock(i)
+            if (s._2 != null) {
+              totalSizes(i) += s._2.getSizeForBlock(i)
+            }
           }
         }
       } else {
@@ -613,7 +647,10 @@ private[spark] class MapOutputTrackerMaster(
           val mapStatusSubmitTasks = equallyDivide(totalSizes.length, parallelism).map {
             reduceIds => Future {
               for (s <- statuses; i <- reduceIds) {
-                totalSizes(i) += s.getSizeForBlock(i)
+                totalSizes(i) += s._1.getSizeForBlock(i)
+                if (s._2 != null) {
+                  totalSizes(i) += s._2.getSizeForBlock(i)
+                }
               }
             }
           }
@@ -682,10 +719,17 @@ private[spark] class MapOutputTrackerMaster(
             // with valid status entries. This is possible if one thread schedules a job which
             // depends on an RDD which is currently being computed by another thread.
             if (status != null) {
-              val blockSize = status.getSizeForBlock(reducerId)
+              val blockSize = status._1.getSizeForBlock(reducerId)
               if (blockSize > 0) {
-                locs(status.location) = locs.getOrElse(status.location, 0L) + blockSize
+                locs(status._1.location) = locs.getOrElse(status._1.location, 0L) + blockSize
                 totalOutputSize += blockSize
+              }
+              if (status._2 != null) {
+                val blockSize = status._2.getSizeForBlock(reducerId)
+                if (blockSize > 0) {
+                  locs(status._1.location) = locs.getOrElse(status._1.location, 0L) + blockSize
+                  totalOutputSize += blockSize
+                }
               }
             }
             mapIdx = mapIdx + 1
@@ -723,7 +767,7 @@ private[spark] class MapOutputTrackerMaster(
         if (startMapIndex < endMapIndex &&
           (startMapIndex >= 0 && endMapIndex <= statuses.length)) {
           val statusesPicked = statuses.slice(startMapIndex, endMapIndex).filter(_ != null)
-          statusesPicked.map(_.location.host).toSeq
+          statusesPicked.map(_._1.location.host).toSeq
         } else {
           Nil
         }
@@ -791,8 +835,8 @@ private[spark] class MapOutputTrackerMaster(
  */
 private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTracker(conf) {
 
-  val mapStatuses: Map[Int, Array[MapStatus]] =
-    new ConcurrentHashMap[Int, Array[MapStatus]]().asScala
+  val mapStatuses: Map[Int, Array[(MapStatus, MapStatus)]] =
+    new ConcurrentHashMap[Int, Array[(MapStatus, MapStatus)]]().asScala // kuofeng
 
   /**
    * A [[KeyLock]] whose key is a shuffle id to ensure there is only one thread fetching
@@ -828,7 +872,8 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
    *
    * (It would be nice to remove this restriction in the future.)
    */
-  private def getStatuses(shuffleId: Int, conf: SparkConf): Array[MapStatus] = {
+  private def getStatuses(shuffleId: Int, conf: SparkConf):
+    Array[(MapStatus, MapStatus)] = { // kuofeng
     val statuses = mapStatuses.get(shuffleId).orNull
     if (statuses == null) {
       logInfo("Don't have map outputs for shuffle " + shuffleId + ", fetching them")
@@ -883,7 +928,7 @@ private[spark] object MapOutputTracker extends Logging {
   // it to reduce tasks. We do this by compressing the serialized bytes using Zstd. They will
   // generally be pretty compressible because many map outputs will be on the same hostname.
   def serializeMapStatuses(
-      statuses: Array[MapStatus],
+      statuses: Array[(MapStatus, MapStatus)],
       broadcastManager: BroadcastManager,
       isLocal: Boolean,
       minBroadcastSize: Int,
@@ -927,7 +972,8 @@ private[spark] object MapOutputTracker extends Logging {
   }
 
   // Opposite of serializeMapStatuses.
-  def deserializeMapStatuses(bytes: Array[Byte], conf: SparkConf): Array[MapStatus] = {
+  def deserializeMapStatuses(bytes: Array[Byte], conf: SparkConf):
+    Array[(MapStatus, MapStatus)] = { // kuofeng
     assert (bytes.length > 0)
 
     def deserializeObject(arr: Array[Byte], off: Int, len: Int): AnyRef = {
@@ -946,7 +992,7 @@ private[spark] object MapOutputTracker extends Logging {
 
     bytes(0) match {
       case DIRECT =>
-        deserializeObject(bytes, 1, bytes.length - 1).asInstanceOf[Array[MapStatus]]
+        deserializeObject(bytes, 1, bytes.length - 1).asInstanceOf[Array[(MapStatus, MapStatus)]]
       case BROADCAST =>
         // deserialize the Broadcast, pull .value array out of it, and then deserialize that
         val bcast = deserializeObject(bytes, 1, bytes.length - 1).
@@ -954,7 +1000,8 @@ private[spark] object MapOutputTracker extends Logging {
         logInfo("Broadcast mapstatuses size = " + bytes.length +
           ", actual size = " + bcast.value.length)
         // Important - ignore the DIRECT tag ! Start from offset 1
-        deserializeObject(bcast.value, 1, bcast.value.length - 1).asInstanceOf[Array[MapStatus]]
+        deserializeObject(bcast.value, 1, bcast.value.length - 1)
+          .asInstanceOf[Array[(MapStatus, MapStatus)]]
       case _ => throw new IllegalArgumentException("Unexpected byte tag = " + bytes(0))
     }
   }
@@ -982,7 +1029,7 @@ private[spark] object MapOutputTracker extends Logging {
       shuffleId: Int,
       startPartition: Int,
       endPartition: Int,
-      statuses: Array[MapStatus],
+      statuses: Array[(MapStatus, MapStatus)],
       startMapIndex : Int,
       endMapIndex: Int): Iterator[(BlockManagerId, Seq[(BlockId, Long, Int)])] = {
     assert (statuses != null)
@@ -995,10 +1042,17 @@ private[spark] object MapOutputTracker extends Logging {
         throw new MetadataFetchFailedException(shuffleId, startPartition, errorMessage)
       } else {
         for (part <- startPartition until endPartition) {
-          val size = status.getSizeForBlock(part)
+          val size = status._1.getSizeForBlock(part)
           if (size != 0) {
-            splitsByAddress.getOrElseUpdate(status.location, ListBuffer()) +=
-              ((ShuffleBlockId(shuffleId, status.mapId, part), size, mapIndex))
+            splitsByAddress.getOrElseUpdate(status._1.location, ListBuffer()) +=
+              ((ShuffleBlockId(shuffleId, status._1.mapId, part), size, mapIndex))
+          }
+          if (status._2 != null) {
+            val size = status._2.getSizeForBlock(part)
+            if (size != 0) {
+              splitsByAddress.getOrElseUpdate(status._2.location, ListBuffer()) +=
+                ((ShuffleBlockId(shuffleId, status._2.mapId, part), size, mapIndex))
+            }
           }
         }
       }

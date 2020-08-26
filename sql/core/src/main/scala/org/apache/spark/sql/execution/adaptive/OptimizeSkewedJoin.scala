@@ -100,7 +100,9 @@ case class OptimizeSkewedJoin(conf: SQLConf) extends Rule[SparkPlan] {
    */
   private def getMapSizesForReduceId(shuffleId: Int, partitionId: Int): Array[Long] = {
     val mapOutputTracker = SparkEnv.get.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
-    mapOutputTracker.shuffleStatuses(shuffleId).mapStatuses.map{_.getSizeForBlock(partitionId)}
+    mapOutputTracker.shuffleStatuses(shuffleId).mapStatuses
+      .map{ status => status._1.getSizeForBlock(partitionId)
+        + status._2.getSizeForBlock(partitionId)}
   }
 
   /**

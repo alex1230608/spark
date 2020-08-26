@@ -264,6 +264,25 @@ private[spark] class DAGScheduler(
     eventProcessLoop.post(GettingResultEvent(taskInfo))
   }
 
+  // kuofeng
+  /**
+   * Called by the TaskSetManager to report task completions or failures.
+   */
+  def taskEnded(
+      task: Task[_],
+      reason: TaskEndReason,
+      result: Any,
+      accumUpdates: Seq[AccumulatorV2[_, _]],
+      metricPeaks: Array[Long],
+      taskInfo: TaskInfo,
+      result2: Any,
+      accumUpdates2: Seq[AccumulatorV2[_, _]],
+      metricPeaks2: Array[Long]): Unit = {
+    eventProcessLoop.post(
+      CompletionEvent2(task, reason, result, accumUpdates, metricPeaks, taskInfo,
+        result2, accumUpdates2, metricPeaks2))
+  }
+
   /**
    * Called by the TaskSetManager to report task completions or failures.
    */
@@ -1419,6 +1438,79 @@ private[spark] class DAGScheduler(
     }
   }
 
+  // kuofeng
+  /**
+   * Merge local values from a task into the corresponding accumulators previously registered
+   * here on the driver.
+   *
+   * Although accumulators themselves are not thread-safe, this method is called only from one
+   * thread, the one that runs the scheduling loop. This means we only handle one task
+   * completion event at a time so we don't need to worry about locking the accumulators.
+   * This still doesn't stop the caller from updating the accumulator outside the scheduler,
+   * but that's not our problem since there's nothing we can do about that.
+   */
+  private def updateAccumulators(event: CompletionEvent2): Unit = {
+    val task = event.task
+    val stage = stageIdToStage(task.stageId)
+
+    event.accumUpdates.foreach { updates =>
+      val id = updates.id
+      try {
+        // Find the corresponding accumulator on the driver and update it
+        val acc: AccumulatorV2[Any, Any] = AccumulatorContext.get(id) match {
+          case Some(accum) => accum.asInstanceOf[AccumulatorV2[Any, Any]]
+          case None =>
+            throw new SparkException(s"attempted to access non-existent accumulator $id")
+        }
+        acc.merge(updates.asInstanceOf[AccumulatorV2[Any, Any]])
+        // To avoid UI cruft, ignore cases where value wasn't updated
+        if (acc.name.isDefined && !updates.isZero) {
+          stage.latestInfo.accumulables(id) = acc.toInfo(None, Some(acc.value))
+          event.taskInfo.setAccumulables(
+            acc.toInfo(Some(updates.value), Some(acc.value)) +: event.taskInfo.accumulables)
+        }
+      } catch {
+        case NonFatal(e) =>
+          // Log the class name to make it easy to find the bad implementation
+          val accumClassName = AccumulatorContext.get(id) match {
+            case Some(accum) => accum.getClass.getName
+            case None => "Unknown class"
+          }
+          logError(
+            s"Failed to update accumulator $id ($accumClassName) for task ${task.partitionId}",
+            e)
+      }
+    }
+    event.accumUpdates2.foreach { updates =>
+      val id = updates.id
+      try {
+        // Find the corresponding accumulator on the driver and update it
+        val acc: AccumulatorV2[Any, Any] = AccumulatorContext.get(id) match {
+          case Some(accum) => accum.asInstanceOf[AccumulatorV2[Any, Any]]
+          case None =>
+            throw new SparkException(s"attempted to access non-existent accumulator $id")
+        }
+        acc.merge(updates.asInstanceOf[AccumulatorV2[Any, Any]])
+        // To avoid UI cruft, ignore cases where value wasn't updated
+        if (acc.name.isDefined && !updates.isZero) {
+          stage.latestInfo.accumulables(id) = acc.toInfo(None, Some(acc.value))
+          event.taskInfo.setAccumulables(
+            acc.toInfo(Some(updates.value), Some(acc.value)) +: event.taskInfo.accumulables)
+        }
+      } catch {
+        case NonFatal(e) =>
+          // Log the class name to make it easy to find the bad implementation
+          val accumClassName = AccumulatorContext.get(id) match {
+            case Some(accum) => accum.getClass.getName
+            case None => "Unknown class"
+          }
+          logError(
+            s"Failed to update accumulator $id ($accumClassName) for task ${task.partitionId}",
+            e)
+      }
+    }
+  }
+
   /**
    * Merge local values from a task into the corresponding accumulators previously registered
    * here on the driver.
@@ -1463,6 +1555,28 @@ private[spark] class DAGScheduler(
     }
   }
 
+  // kuofeng
+  private def postTaskEnd(event: CompletionEvent2): Unit = {
+    val taskMetrics: TaskMetrics =
+      if (event.accumUpdates.nonEmpty || event.accumUpdates2.nonEmpty) {
+        try {
+          TaskMetrics.fromAccumulators(event.accumUpdates, event.accumUpdates)
+        } catch {
+          case NonFatal(e) =>
+            val taskId = event.taskInfo.taskId
+            logError(s"Error when attempting to reconstruct metrics for task $taskId", e)
+            null
+        }
+      } else {
+        null
+      }
+
+    listenerBus.post(SparkListenerTaskEnd(event.task.stageId, event.task.stageAttemptId,
+      Utils.getFormattedClassName(event.task), event.reason, event.taskInfo,
+      new ExecutorMetrics(event.metricPeaks), taskMetrics))
+      // for now randomly use the first metrics for executor
+  }
+
   private def postTaskEnd(event: CompletionEvent): Unit = {
     val taskMetrics: TaskMetrics =
       if (event.accumUpdates.nonEmpty) {
@@ -1501,6 +1615,176 @@ private[spark] class DAGScheduler(
             s"is invalid: $shouldInterruptThread. Using 'false' instead", e)
           false
       }
+    }
+  }
+
+  // kuofeng
+  /**
+   * Responds to a task finishing. This is called inside the event loop so it assumes that it can
+   * modify the scheduler's internal state. Use taskEnded() to post a task end event from outside.
+   */
+  private[scheduler] def handleTaskCompletion(event: CompletionEvent2): Unit = {
+    val task = event.task
+    val stageId = task.stageId
+
+    outputCommitCoordinator.taskCompleted(
+      stageId,
+      task.stageAttemptId,
+      task.partitionId,
+      event.taskInfo.attemptNumber, // this is a task attempt number
+      event.reason)
+
+    if (!stageIdToStage.contains(task.stageId)) {
+      // The stage may have already finished when we get this event -- eg. maybe it was a
+      // speculative task. It is important that we send the TaskEnd event in any case, so listeners
+      // are properly notified and can chose to handle it. For instance, some listeners are
+      // doing their own accounting and if they don't get the task end event they think
+      // tasks are still running when they really aren't.
+      postTaskEnd(event)
+
+      // Skip all the actions if the stage has been cancelled.
+      return
+    }
+
+    val stage = stageIdToStage(task.stageId)
+
+    // Make sure the task's accumulators are updated before any other processing happens, so that
+    // we can post a task end event before any jobs or stages are updated. The accumulators are
+    // only updated in certain cases.
+    event.reason match {
+      case Success =>
+        task match {
+          case rt: ResultTask[_, _] =>
+            val resultStage = stage.asInstanceOf[ResultStage]
+            resultStage.activeJob match {
+              case Some(job) =>
+                // Only update the accumulator once for each result task.
+                if (!job.finished(rt.outputId)) {
+                  updateAccumulators(event)
+                }
+              case None => // Ignore update if task's job has finished.
+            }
+          case _ =>
+            updateAccumulators(event)
+        }
+      case _: ExceptionFailure | _: TaskKilled => updateAccumulators(event)
+      case _ =>
+    }
+    postTaskEnd(event)
+
+    event.reason match {
+      case Success =>
+        // An earlier attempt of a stage (which is zombie) may still have running tasks. If these
+        // tasks complete, they still count and we can mark the corresponding partitions as
+        // finished. Here we notify the task scheduler to skip running tasks for the same partition,
+        // to save resource.
+        if (task.stageAttemptId < stage.latestInfo.attemptNumber()) {
+          taskScheduler.notifyPartitionCompletion(stageId, task.partitionId)
+        }
+
+        task match {
+          case rt: ResultTask[_, _] =>
+            // Cast to ResultStage here because it's part of the ResultTask
+            // TODO Refactor this out to a function that accepts a ResultStage
+            val resultStage = stage.asInstanceOf[ResultStage]
+            resultStage.activeJob match {
+              case Some(job) =>
+                if (!job.finished(rt.outputId)) {
+                  job.finished(rt.outputId) = true
+                  job.numFinished += 1
+                  // If the whole job has finished, remove it
+                  if (job.numFinished == job.numPartitions) {
+                    markStageAsFinished(resultStage)
+                    cancelRunningIndependentStages(job, s"Job ${job.jobId} is finished.")
+                    cleanupStateForJobAndIndependentStages(job)
+                    try {
+                      // killAllTaskAttempts will fail if a SchedulerBackend does not implement
+                      // killTask.
+                      logInfo(s"Job ${job.jobId} is finished. Cancelling potential speculative " +
+                        "or zombie tasks for this job")
+                      // ResultStage is only used by this job. It's safe to kill speculative or
+                      // zombie tasks in this stage.
+                      taskScheduler.killAllTaskAttempts(
+                        stageId,
+                        shouldInterruptTaskThread(job),
+                        reason = "Stage finished")
+                    } catch {
+                      case e: UnsupportedOperationException =>
+                        logWarning(s"Could not cancel tasks for stage $stageId", e)
+                    }
+                    listenerBus.post(
+                      SparkListenerJobEnd(job.jobId, clock.getTimeMillis(), JobSucceeded))
+                  }
+
+                  // taskSucceeded runs some user code that might throw an exception. Make sure
+                  // we are resilient against that.
+                  try {
+                    job.listener.taskSucceeded(rt.outputId, event.result)
+                    // job.listener.taskSucceeded(rt.outputId, event.result2)
+                    // NOT WORKING: taskSucceeded will increment the number of tasks finished
+                    //              => we cannot do it twice
+                  } catch {
+                    case e: Throwable if !Utils.isFatalError(e) =>
+                      // TODO: Perhaps we want to mark the resultStage as failed?
+                      job.listener.jobFailed(new SparkDriverExecutionException(e))
+                  }
+                }
+              case None =>
+                logInfo("Ignoring result from " + rt + " because its job has finished")
+            }
+
+          case smt: ShuffleMapTask =>
+            val shuffleStage = stage.asInstanceOf[ShuffleMapStage]
+            shuffleStage.pendingPartitions -= task.partitionId
+            val status = event.result.asInstanceOf[MapStatus]
+            val status2 = event.result2.asInstanceOf[MapStatus]
+            val execId = status.location.executorId
+            logDebug("ShuffleMapTask finished on " + execId)
+            if (executorFailureEpoch.contains(execId) &&
+                smt.epoch <= executorFailureEpoch(execId)) {
+              logInfo(s"Ignoring possibly bogus $smt completion from executor $execId")
+            } else {
+              // The epoch of the task is acceptable (i.e., the task was launched after the most
+              // recent failure we're aware of for the executor), so mark the task's output as
+              // available.
+              mapOutputTracker.registerMapOutput(
+                shuffleStage.shuffleDep.shuffleId, smt.partitionId, status, status2)
+            }
+
+            if (runningStages.contains(shuffleStage) && shuffleStage.pendingPartitions.isEmpty) {
+              markStageAsFinished(shuffleStage)
+              logInfo("looking for newly runnable stages")
+              logInfo("running: " + runningStages)
+              logInfo("waiting: " + waitingStages)
+              logInfo("failed: " + failedStages)
+
+              // This call to increment the epoch may not be strictly necessary, but it is retained
+              // for now in order to minimize the changes in behavior from an earlier version of the
+              // code. This existing behavior of always incrementing the epoch following any
+              // successful shuffle map stage completion may have benefits by causing unneeded
+              // cached map outputs to be cleaned up earlier on executors. In the future we can
+              // consider removing this call, but this will require some extra investigation.
+              // See https://github.com/apache/spark/pull/17955/files#r117385673 for more details.
+              mapOutputTracker.incrementEpoch()
+
+              clearCacheLocs()
+
+              if (!shuffleStage.isAvailable) {
+                // Some tasks had failed; let's resubmit this shuffleStage.
+                // TODO: Lower-level scheduler should also deal with this
+                logInfo("Resubmitting " + shuffleStage + " (" + shuffleStage.name +
+                  ") because some of its tasks had failed: " +
+                  shuffleStage.findMissingPartitions().mkString(", "))
+                submitStage(shuffleStage)
+              } else {
+                markMapStageJobsAsFinished(shuffleStage)
+                submitWaitingChildStages(shuffleStage)
+              }
+            }
+        }
+      case _ =>
+        logError("kuofeng: only SUCCESS case supported in CompletitionEvent2")
+        System.exit(1)
     }
   }
 
@@ -2391,6 +2675,9 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
       dagScheduler.handleGetTaskResult(taskInfo)
 
     case completion: CompletionEvent =>
+      dagScheduler.handleTaskCompletion(completion)
+
+    case completion: CompletionEvent2 =>
       dagScheduler.handleTaskCompletion(completion)
 
     case TaskSetFailed(taskSet, reason, exception) =>

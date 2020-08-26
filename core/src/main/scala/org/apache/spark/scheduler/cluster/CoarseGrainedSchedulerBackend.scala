@@ -78,6 +78,8 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
 
   // kuofeng
   private var nicExecutorData: ExecutorData = null
+  private var nicOrHostSuccess: Int = 0
+  private var nicOrHostFirstStatus: StatusUpdate = null
 
   // Number of executors for each ResourceProfile requested by the cluster
   // manager, [[ExecutorAllocationManager]]
@@ -144,26 +146,53 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
 
     override def receive: PartialFunction[Any, Unit] = {
       case StatusUpdate(executorId, taskId, state, data, resources) =>
-        scheduler.statusUpdate(taskId, state, data.value)
-        if (TaskState.isFinished(state)) {
-          logInfo("kuofeng: StatusUpdate in scheduler, task finished from host: " +
-            executorDataMap(executorId).executorHost)
-          executorDataMap.get(executorId) match {
-            case Some(executorInfo) =>
-              val rpId = executorInfo.resourceProfileId
-              val prof = scheduler.sc.resourceProfileManager.resourceProfileFromId(rpId)
-              val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(prof, conf)
-              executorInfo.freeCores += taskCpus
-              resources.foreach { case (k, v) =>
-                executorInfo.resourcesInfo.get(k).foreach { r =>
-                  r.release(v.addresses)
+        // kuofeng
+        if (TaskState.isFinished(state)
+          && executorDataMap(executorId).executorHost.equals("192.168.100.202")
+          // a dangerous trick: nic + host == two success
+          && nicOrHostSuccess == 0) { // only one of them is finished
+            nicOrHostSuccess = nicOrHostSuccess + 1
+            // we need to queue the current one
+            nicOrHostFirstStatus =
+              StatusUpdate(executorId, taskId, state, data, resources)
+        } else {
+          if (nicOrHostSuccess == 1
+            && TaskState.isFinished(state)
+            && executorDataMap(executorId).executorHost.equals("192.168.100.202")) {
+
+            // merge the two status
+            val prev = nicOrHostFirstStatus
+            if (!executorId.equals(prev.executorId)
+              || taskId != prev.taskId
+              || state != prev.state) {
+              logInfo("kuofeng: StatusUpdate gets two different tasks "
+                + "from host and nic")
+              System.exit(1)
+            }
+            scheduler.statusUpdate(taskId, state, data.value, prev.data.value)
+          } else {
+            scheduler.statusUpdate(taskId, state, data.value)
+          }
+          if (TaskState.isFinished(state)) {
+            logInfo("kuofeng: StatusUpdate in scheduler, task finished from host: " +
+              executorDataMap(executorId).executorHost)
+            executorDataMap.get(executorId) match {
+              case Some(executorInfo) =>
+                val rpId = executorInfo.resourceProfileId
+                val prof = scheduler.sc.resourceProfileManager.resourceProfileFromId(rpId)
+                val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(prof, conf)
+                executorInfo.freeCores += taskCpus
+                resources.foreach { case (k, v) =>
+                  executorInfo.resourcesInfo.get(k).foreach { r =>
+                    r.release(v.addresses)
+                  }
                 }
-              }
-              makeOffers(executorId)
-            case None =>
-              // Ignoring the update since we don't know about the executor.
-              logWarning(s"Ignored task status update ($taskId state $state) " +
-                s"from unknown executor with ID $executorId")
+                makeOffers(executorId)
+              case None =>
+                // Ignoring the update since we don't know about the executor.
+                logWarning(s"Ignored task status update ($taskId state $state) " +
+                  s"from unknown executor with ID $executorId")
+            }
           }
         }
 
@@ -408,9 +437,23 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
           logInfo(s"kuofeng: SchedulerBackend send LaunchTask to Execuitor, " +
             s"host: " + executorData.executorHost);
 
+          // kuofeng
+          var useNic: Boolean = false
+          Option(scheduler.taskIdToTaskSetManager.get(task.taskId)).foreach { taskSetMgr =>
+            if (taskSetMgr.stageId == 0) {
+              useNic = true
+            }
+          }
+
           if (executorData.executorHost.equals("192.168.100.202")) {
-            nicExecutorData.executorEndpoint.send(
-              LaunchTask(new SerializableBuffer(serializedTask)))
+            if (useNic) {
+              nicOrHostSuccess = 0
+              nicExecutorData.executorEndpoint.send(
+                LaunchTask(new SerializableBuffer(serializedTask)))
+            } else {
+              nicOrHostSuccess = 2
+            }
+            executorData.executorEndpoint.send(LaunchTask(new SerializableBuffer(serializedTask)))
           } else {
             executorData.executorEndpoint.send(LaunchTask(new SerializableBuffer(serializedTask)))
           }
